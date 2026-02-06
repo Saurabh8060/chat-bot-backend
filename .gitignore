@@ -21,3 +21,4 @@ chunks.npy
 chunks_meta.json
 ingested_urls.json
 data/
+.hf_cache/
