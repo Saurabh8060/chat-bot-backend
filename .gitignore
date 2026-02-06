@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+venv/
+.venv/
+
+.env
+.env.*
+
+*.log
+
+# Local data / artifacts
+faiss.index
+chunks.npy
+chunks_meta.json
+ingested_urls.json
+data/
