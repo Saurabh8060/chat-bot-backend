@@ -12,7 +12,7 @@ if PROJECT_ROOT not in sys.path:
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
-from src.helper import ensure_vectorstore, ingest_qa
+from src.helper import build_index, dedupe_pairs
 
 
 def _get_field(row: dict, keys: Iterable[str]) -> str:
@@ -23,36 +23,27 @@ def _get_field(row: dict, keys: Iterable[str]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest MedQuAD Q/A pairs into Pinecone.")
+    parser = argparse.ArgumentParser(description="Build FAISS index for MedQuAD Q/A pairs.")
     parser.add_argument("--dataset", default="keivalya/MedQuad-MedicalQnADataset")
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=0, help="Limit rows for quick tests")
-    parser.add_argument("--batch", type=int, default=256)
-    parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
 
     ds = load_dataset(args.dataset, split=args.split)
     if args.limit and args.limit > 0:
         ds = ds.select(range(min(args.limit, len(ds))))
 
-    ensure_vectorstore()
-    batch = []
-    total = 0
-
+    pairs = []
     for row in ds:
         question = _get_field(row, ["Question", "question", "QUESTION"])
         answer = _get_field(row, ["Answer", "answer", "ANSWER"])
         if not question or not answer:
             continue
-        batch.append((question, answer))
-        if len(batch) >= args.batch:
-            total += ingest_qa(batch, replace=args.replace if total == 0 else False)
-            batch = []
+        pairs.append((question, answer))
 
-    if batch:
-        total += ingest_qa(batch, replace=args.replace if total == 0 else False)
-
-    print(f"Ingested {total} Q/A pairs from {args.dataset}:{args.split}")
+    pairs = dedupe_pairs(pairs)
+    total = build_index(pairs)
+    print(f"Indexed {total} Q/A pairs from {args.dataset}:{args.split}")
 
 
 if __name__ == "__main__":

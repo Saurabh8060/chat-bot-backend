@@ -3,30 +3,11 @@ fastapi>=0.110.0
 uvicorn>=0.27.0
 python-dotenv>=1.0.0
 pydantic>=2.5.0
-python-multipart>=0.0.9
 
-# RAG stack (local embeddings + optional OpenAI + Pinecone/FAISS)
-langchain>=0.2.11
-langchain-community>=0.2.10
-langchain-openai>=0.1.14
-langchain-text-splitters>=0.2.2
-pinecone>=5.0.0
-langchain-pinecone
+# Local RAG stack (CPU-only)
 sentence-transformers>=2.2.2
+faiss-cpu>=1.7.4
 transformers>=4.36.0
 torch>=2.0.0
 datasets>=2.16.0
-
-# PDF
-pypdf>=4.2.0
-
-# LangChain + Pinecone
-langchain>=0.2.11
-langchain-text-splitters>=0.2.2
-langchain-community>=0.2.10
-langchain-openai>=0.1.14
-langchain-pinecone
-pinecone>=5.0.0
-
-# Text processing
 numpy>=1.24.0
