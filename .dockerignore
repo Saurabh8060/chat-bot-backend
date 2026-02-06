@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+venv
+.venv
+__pycache__
+*.pyc
+data
+training
+embeddings
+inference
+trials.ipynb
+medical-chatbot-backend
