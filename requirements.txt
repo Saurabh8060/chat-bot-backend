@@ -15,6 +15,7 @@ langchain-pinecone
 sentence-transformers>=2.2.2
 transformers>=4.36.0
 torch>=2.0.0
+datasets>=2.16.0
 
 # PDF
 pypdf>=4.2.0

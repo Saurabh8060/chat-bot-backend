@@ -1,10 +1,12 @@
 import os
 import re
+import difflib
 import logging
 from dataclasses import dataclass
 from typing import List, Tuple
 
 from pinecone import Pinecone, ServerlessSpec
+from pinecone.exceptions import NotFoundException
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -43,7 +45,7 @@ class _LLMResponse:
 
 def download_embeddings() -> HuggingFaceEmbeddings:
     """Download and return the HuggingFace embeddings model."""
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
     embeddings = HuggingFaceEmbeddings(model_name=model_name)
     return embeddings
 
@@ -58,6 +60,7 @@ def ensure_vectorstore() -> None:
         return
 
     embeddings = _get_embeddings()
+    embedding_dim = int(os.getenv("EMBEDDING_DIM", "768"))
 
     if not PINECONE_API_KEY:
         raise RuntimeError("PINECONE_API_KEY is not set. FAISS fallback is disabled.")
@@ -68,17 +71,17 @@ def ensure_vectorstore() -> None:
     if PINECONE_INDEX_NAME not in indexes:
         _pc.create_index(
             name=PINECONE_INDEX_NAME,
-            dimension=384,
+            dimension=embedding_dim,
             metric="cosine",
             spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION),
         )
     else:
         try:
             info = _pc.describe_index(PINECONE_INDEX_NAME)
-            if getattr(info, "dimension", None) not in (None, 384):
+            if getattr(info, "dimension", None) not in (None, embedding_dim):
                 raise RuntimeError(
                     f"Pinecone index '{PINECONE_INDEX_NAME}' has dimension {info.dimension}, "
-                    "but embeddings are 384. Create a new index or change PINECONE_INDEX_NAME."
+                    f"but embeddings are {embedding_dim}. Create a new index or change PINECONE_INDEX_NAME."
                 )
         except Exception as exc:
             raise RuntimeError(
@@ -135,6 +138,15 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _clean_answer_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    # Remove leading bullets/stray punctuation from dataset artifacts
+    text = re.sub(r"^[\)\]\}\.\,\-–•\s]+", "", text)
+    return text.strip()
+
+
 def _is_boilerplate_line(line: str) -> bool:
     line_l = line.lower()
     if re.fullmatch(r"\d{1,4}", line_l):
@@ -183,11 +195,34 @@ def ingest_text(chunks: List[str], replace: bool = False) -> int:
     return len(docs)
 
 
+def ingest_qa(pairs: List[tuple[str, str]], replace: bool = False) -> int:
+    ensure_vectorstore()
+    if replace:
+        reset_store()
+
+    docs = []
+    for q, a in pairs:
+        q = q.strip()
+        a = a.strip()
+        if not q or not a:
+            continue
+        docs.append(Document(page_content=q, metadata={"answer": a, "source": "medquad"}))
+
+    if not docs:
+        return 0
+    _vectorstore.add_documents(docs)  # type: ignore[union-attr]
+    return len(docs)
+
+
 def reset_store() -> None:
     global _vectorstore
     if not _index_ready or _vectorstore is None:
         return
-    _vectorstore.delete(namespace="default", delete_all=True)
+    try:
+        _vectorstore.delete(namespace="default", delete_all=True)
+    except NotFoundException:
+        # Namespace doesn't exist yet; nothing to delete.
+        logger.info("Pinecone namespace 'default' not found; skipping delete.")
 
 
 def get_retrieved_docs(question: str) -> List[Document]:
@@ -279,13 +314,37 @@ def _get_hf_llm(model_name: str, max_new_tokens: int, temperature: float, top_p:
     return _HFWrapper()
 
 
-def answer_question(question: str) -> dict:
-    docs = get_retrieved_docs(question)
+def answer_question(question: str, last_topic: str | None = None) -> dict:
+    if _is_greeting(question):
+        return {"answer": "Please ask a medical question.", "sources": []}
+
+    docs, best_score = _retrieve_with_scores(question)
     if not docs:
         return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
 
-    # Build a short, high-signal context: top-K sentences from retrieved docs.
-    context = _top_k_sentences(question, docs)
+    if _needs_clarification(question):
+        if last_topic:
+            question = f"{question} (about: {last_topic})"
+        else:
+            return {"answer": "Please specify the condition or topic you're asking about.", "sources": []}
+
+    # Refresh retrieval if we expanded the question with context.
+    docs, best_score = _retrieve_with_scores(question)
+    if not docs:
+        return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
+
+    min_score = float(os.getenv("MIN_RETRIEVAL_SCORE", "0.15"))
+    if best_score is not None and best_score < min_score:
+        return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
+
+    # Re-rank docs by fuzzy match against the Q line (if present).
+    docs = _rerank_docs_by_question(question, docs)
+    min_q_match = float(os.getenv("MIN_QUESTION_MATCH", "0.42"))
+    if docs and docs[0].metadata.get("_qmatch", 0.0) < min_q_match:
+        return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
+
+    # Build context from top documents (Q/A pairs for MedQuAD).
+    context = _top_k_docs_text(docs)
     if not context:
         return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
     llm = _get_llm()
@@ -295,8 +354,26 @@ def answer_question(question: str) -> dict:
     prompt = RAG_PROMPT.format(context=context, question=question)
     response = llm.invoke(prompt)
     answer = _sanitize_llm_output(response.content, prompt, context)
+    answer = _clean_answer_text(answer)
     if not answer:
         return {"answer": "I don't know. The answer isn't in the provided context.", "sources": []}
+
+    if _sentence_count(answer) < 2:
+        expand_prompt = (
+            "Rewrite the answer in 2–4 sentences using ONLY the context. "
+            "Do not add new facts.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Answer:\n{answer}\n\n"
+            "Expanded answer:"
+        )
+        expanded = llm.invoke(expand_prompt)
+        expanded_text = _sanitize_llm_output(expanded.content, expand_prompt, context)
+        if expanded_text and _sentence_count(expanded_text) >= 2:
+            answer = _clean_answer_text(expanded_text)
+        else:
+            extra = _second_sentence_from_context(answer, context)
+            if extra:
+                answer = f"{answer.rstrip('. ')}. {extra}"
 
     return {
         "answer": answer,
@@ -304,42 +381,106 @@ def answer_question(question: str) -> dict:
     }
 
 
-def _top_k_sentences(question: str, docs: List[Document]) -> str:
-    k = int(os.getenv("TOP_K_SENTENCES", "10"))
-    q_tokens = {t for t in re.split(r"\W+", question.lower()) if len(t) > 2}
-    sentences: List[Tuple[str, int]] = []
+def _top_k_docs_text(docs: List[Document]) -> str:
+    k = int(os.getenv("TOP_K_DOCS", "4"))
+    parts = []
+    for d in docs[:k]:
+        if d.page_content:
+            answer = (d.metadata or {}).get("answer") if hasattr(d, "metadata") else None
+            if isinstance(answer, str) and answer.strip():
+                parts.append(_clean_answer_text(answer))
+            else:
+                extracted = _extract_doc_answer(d.page_content)
+                if extracted:
+                    parts.append(extracted)
+                else:
+                    parts.append(d.page_content.strip())
+    return "\n\n".join(parts).strip()
+
+
+def _rerank_docs_by_question(question: str, docs: List[Document]) -> List[Document]:
+    q_norm = _normalize_text(question)
+    ranked = []
     for d in docs:
-        for sent in re.split(r"(?<=[.!?])\s+", d.page_content):
-            sent = sent.strip()
-            if len(sent) < 20:
-                continue
-            s_tokens = {t for t in re.split(r"\W+", sent.lower()) if len(t) > 2}
-            score = len(q_tokens & s_tokens)
-            sentences.append((sent, score))
+        q_line = _extract_doc_question(d.page_content)
+        target = _normalize_text(q_line or d.page_content)
+        score = difflib.SequenceMatcher(None, q_norm, target).ratio()
+        d.metadata = dict(d.metadata or {})
+        d.metadata["_qmatch"] = score
+        ranked.append((score, d))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in ranked]
 
-    if not sentences:
-        return ""
 
-    # Sort by score then length, keep top-k.
-    sentences.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
-    top = [s for s, _ in sentences[:k]]
+def _extract_doc_question(text: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("q:"):
+            return line[2:].strip()
+    return ""
 
-    # If all scores are zero, fall back to the first k sentences from docs.
-    if sentences[0][1] == 0:
-        fallback = []
-        for d in docs:
-            for sent in re.split(r"(?<=[.!?])\s+", d.page_content):
-                sent = sent.strip()
-                if len(sent) < 20:
-                    continue
-                fallback.append(sent)
-                if len(fallback) >= k:
-                    break
-            if len(fallback) >= k:
+
+def _extract_doc_answer(text: str) -> str:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    collecting = False
+    answer_parts = []
+    for ln in lines:
+        if ln.lower().startswith("a:"):
+            collecting = True
+            answer_parts.append(ln[2:].strip())
+            continue
+        if ln.lower().startswith("q:"):
+            if collecting:
                 break
-        top = fallback or top
+            continue
+        if collecting:
+            answer_parts.append(ln)
+    answer = " ".join(answer_parts).strip()
+    return answer
 
-    return " ".join(top).strip()
+
+def _normalize_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _retrieve_with_scores(question: str) -> Tuple[List[Document], float | None]:
+    ensure_vectorstore()
+    # Try to use scores if supported by the vectorstore.
+    try:
+        results = _vectorstore.similarity_search_with_score(question, k=TOP_K)  # type: ignore[union-attr]
+        if not results:
+            return [], None
+        docs = [d for d, _ in results]
+        # Pinecone returns similarity; higher is better.
+        best_score = max(score for _, score in results)
+        return docs, float(best_score)
+    except Exception:
+        docs = get_retrieved_docs(question)
+        return docs, None
+
+
+
+
+def _is_greeting(text: str) -> bool:
+    t = text.strip().lower()
+    return t in {"hi", "hello", "hey", "yo"}
+
+
+def _needs_clarification(question: str) -> bool:
+    q = question.lower().strip()
+    tokens = [t for t in re.split(r"\W+", q) if t]
+    if len(tokens) < 3:
+        return True
+    if "talking about" in q or "we talking" in q or "discussing" in q:
+        return True
+    if tokens and tokens[-1] in {"it", "this", "that", "they"}:
+        return True
+    if any(t in {"it", "this", "that"} for t in tokens) and len(tokens) <= 4:
+        return True
+    return False
 
 
 def _sanitize_llm_output(text: str, prompt: str, context: str) -> str:
@@ -357,3 +498,33 @@ def _sanitize_llm_output(text: str, prompt: str, context: str) -> str:
     # Final cleanup of repeated whitespace.
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _sentence_count(text: str) -> int:
+    parts = [s for s in re.split(r"[.!?]+\s+", text.strip()) if s]
+    return len(parts)
+
+
+def _second_sentence_from_context(answer: str, context: str) -> str:
+    answer_tokens = _content_tokens(answer)
+    for sent in re.split(r"(?<=[.!?])\s+", context):
+        sent = sent.strip()
+        if len(sent) < 20:
+            continue
+        s_tokens = _content_tokens(sent)
+        if not s_tokens:
+            continue
+        # pick a sentence that adds new info
+        if len(s_tokens - answer_tokens) >= 3:
+            return sent.rstrip(". ")
+    return ""
+
+
+def _content_tokens(text: str) -> set[str]:
+    stop = {
+        "what", "was", "about", "talking", "talk", "we", "you", "i", "me", "my",
+        "the", "a", "an", "is", "are", "was", "were", "this", "that", "it",
+        "how", "why", "when", "where", "which", "who", "whom", "do", "does",
+        "did", "can", "could", "should", "would", "please"
+    }
+    return {t for t in re.split(r"\W+", text.lower()) if len(t) > 2 and t not in stop}

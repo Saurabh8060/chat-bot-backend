@@ -38,6 +38,7 @@ class IngestRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str | None = None
     question: str | None = None
+    last_topic: str | None = None
 
 
 @app.get("/health")
@@ -77,7 +78,7 @@ def chat(payload: ChatRequest):
         return {"answer": "Please provide a question.", "sources": []}
 
     ensure_vectorstore()
-    return answer_question(question)
+    return answer_question(question, last_topic=payload.last_topic)
 
 
 @app.post("/ingest_pdf")
