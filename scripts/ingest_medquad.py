@@ -23,7 +23,7 @@ def _get_field(row: dict, keys: Iterable[str]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build FAISS index for MedQuAD Q/A pairs.")
+    parser = argparse.ArgumentParser(description="Build Pinecone index for MedQuAD Q/A pairs.")
     parser.add_argument("--dataset", default="keivalya/MedQuad-MedicalQnADataset")
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=0, help="Limit rows for quick tests")

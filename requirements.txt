@@ -4,9 +4,8 @@ uvicorn>=0.27.0
 python-dotenv>=1.0.0
 pydantic>=2.5.0
 
-# Local RAG stack (CPU-only)
+# RAG stack (CPU-only)
 sentence-transformers>=2.2.2
-faiss-cpu>=1.7.4
 transformers>=4.36.0
 torch>=2.0.0
 datasets>=2.16.0

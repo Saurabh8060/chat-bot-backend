@@ -16,7 +16,6 @@ venv312/
 *.log
 
 # Local data / artifacts
-faiss.index
 chunks.npy
 chunks_meta.json
 ingested_urls.json
