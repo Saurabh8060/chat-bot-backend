@@ -1,5 +1,7 @@
 import os
 import re
+import math
+from difflib import get_close_matches
 from typing import List, Tuple
 
 import numpy as np
@@ -17,6 +19,10 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", str(max(20, TOP_K * 8))))
 CONTEXT_TOP_K = int(os.getenv("CONTEXT_TOP_K", str(TOP_K)))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "2400"))
+TYPO_CORRECTION_CUTOFF = float(os.getenv("TYPO_CORRECTION_CUTOFF", "0.80"))
+TYPO_CORRECTION_ROUNDS = int(os.getenv("TYPO_CORRECTION_ROUNDS", "2"))
+TYPO_BOOTSTRAP_MULTIPLIER = int(os.getenv("TYPO_BOOTSTRAP_MULTIPLIER", "4"))
+TYPO_BOOTSTRAP_MAX_K = int(os.getenv("TYPO_BOOTSTRAP_MAX_K", "120"))
 SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.35"))
 FALLBACK_ANSWER = "I don't know based on the available medical data."
 
@@ -99,10 +105,6 @@ _GENERIC_QUERY_TERMS = {
     "on",
     "with",
     "about",
-}
-_QUERY_NORMALIZATION_MAP = {
-    "treatement": "treatment",
-    "medecine": "medicine",
 }
 _GREETING_PATTERNS = [
     r"^\s*(hi|hello|hey|yo|hola)\b[!. ]*$",
@@ -258,34 +260,58 @@ def _get_generator():
     return _generator
 
 
-def _generate_text(prompt: str) -> str:
+def _generate_text(
+    prompt: str,
+    *,
+    max_new_tokens: int | None = None,
+    min_new_tokens: int | None = None,
+    num_beams: int | None = None,
+    no_repeat_ngram_size: int | None = None,
+    repetition_penalty: float | None = None,
+) -> str:
     tokenizer, model = _get_generator()
     inputs = tokenizer(prompt, return_tensors="pt")
+    gen_max_new_tokens = max_new_tokens if max_new_tokens is not None else HF_MAX_NEW_TOKENS
+    gen_min_new_tokens = (
+        min_new_tokens
+        if min_new_tokens is not None
+        else min(HF_MIN_NEW_TOKENS, gen_max_new_tokens)
+    )
+    gen_num_beams = num_beams if num_beams is not None else HF_NUM_BEAMS
+    gen_no_repeat = (
+        no_repeat_ngram_size if no_repeat_ngram_size is not None else HF_NO_REPEAT_NGRAM_SIZE
+    )
+    gen_rep_penalty = repetition_penalty if repetition_penalty is not None else HF_REPETITION_PENALTY
+
     try:
         import torch
 
         with torch.inference_mode():
-            outputs = model.generate(
+            kwargs = {
                 **inputs,
-                max_new_tokens=HF_MAX_NEW_TOKENS,
-                min_new_tokens=min(HF_MIN_NEW_TOKENS, HF_MAX_NEW_TOKENS),
-                do_sample=False,
-                num_beams=HF_NUM_BEAMS,
-                no_repeat_ngram_size=HF_NO_REPEAT_NGRAM_SIZE,
-                repetition_penalty=HF_REPETITION_PENALTY,
-                early_stopping=True,
-            )
+                "max_new_tokens": gen_max_new_tokens,
+                "min_new_tokens": min(gen_min_new_tokens, gen_max_new_tokens),
+                "do_sample": False,
+                "num_beams": gen_num_beams,
+                "repetition_penalty": gen_rep_penalty,
+                "early_stopping": True,
+            }
+            if gen_no_repeat > 0:
+                kwargs["no_repeat_ngram_size"] = gen_no_repeat
+            outputs = model.generate(**kwargs)
     except Exception:
-        outputs = model.generate(
+        kwargs = {
             **inputs,
-            max_new_tokens=HF_MAX_NEW_TOKENS,
-            min_new_tokens=min(HF_MIN_NEW_TOKENS, HF_MAX_NEW_TOKENS),
-            do_sample=False,
-            num_beams=HF_NUM_BEAMS,
-            no_repeat_ngram_size=HF_NO_REPEAT_NGRAM_SIZE,
-            repetition_penalty=HF_REPETITION_PENALTY,
-            early_stopping=True,
-        )
+            "max_new_tokens": gen_max_new_tokens,
+            "min_new_tokens": min(gen_min_new_tokens, gen_max_new_tokens),
+            "do_sample": False,
+            "num_beams": gen_num_beams,
+            "repetition_penalty": gen_rep_penalty,
+            "early_stopping": True,
+        }
+        if gen_no_repeat > 0:
+            kwargs["no_repeat_ngram_size"] = gen_no_repeat
+        outputs = model.generate(**kwargs)
     return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
@@ -370,16 +396,90 @@ def _clean_generated_answer(text: str) -> str:
     return cleaned
 
 
-def _postprocess_answer(answer: str) -> str:
-    return _clean_generated_answer(answer)
+def _answer_mentions_focus(answer: str, focus_phrase: str) -> bool:
+    if not answer or not focus_phrase:
+        return True
+    answer_lc = re.sub(r"\s+", " ", answer.lower()).strip()
+    focus_lc = re.sub(r"\s+", " ", focus_phrase.lower()).strip()
+    answer_tokens = _tokenize(answer_lc)
+    focus_tokens = [t for t in _tokenize(focus_lc) if len(t) > 2]
+    if not focus_tokens:
+        return True
+    # Prefer exact phrase mention for multi-word focus.
+    if len(focus_tokens) >= 2 and focus_lc in answer_lc:
+        return True
+    overlap = len(set(focus_tokens) & answer_tokens)
+    # For multi-token focus, require strong overlap.
+    required = 1 if len(focus_tokens) == 1 else max(1, math.ceil(len(focus_tokens) * 0.8))
+    return overlap >= required
+
+
+def _rewrite_answer_with_focus(answer: str, focus_phrase: str) -> str:
+    if not answer or not focus_phrase:
+        return answer
+    prompt = (
+        "Rewrite the answer in clear natural English.\n"
+        "Keep the same facts only. Do not add any new facts.\n"
+        f'First sentence must explicitly mention "{focus_phrase}".\n'
+        "Return only the rewritten answer.\n\n"
+        f"Answer: {answer}\n"
+        "Rewritten answer:"
+    )
+    try:
+        rewritten = _generate_text(
+            prompt,
+            max_new_tokens=min(140, HF_MAX_NEW_TOKENS),
+            min_new_tokens=0,
+            num_beams=2,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.05,
+        )
+    except Exception:
+        return answer
+    rewritten = _clean_answer(_clean_generated_answer(rewritten))
+    if not rewritten:
+        return answer
+    return rewritten
+
+
+def _postprocess_answer(answer: str, question_for_focus: str | None = None) -> str:
+    cleaned = _clean_generated_answer(answer)
+    cleaned = _clean_answer(cleaned)
+    if cleaned and cleaned != FALLBACK_ANSWER and not re.search(r"[.!?]$", cleaned):
+        cleaned = f"{cleaned}."
+    if not question_for_focus or cleaned == FALLBACK_ANSWER:
+        return cleaned
+    focus_phrase = _question_focus_phrase(question_for_focus)
+    if not focus_phrase:
+        return cleaned
+    if _answer_mentions_focus(cleaned, focus_phrase):
+        return cleaned
+    rewritten = _rewrite_answer_with_focus(cleaned, focus_phrase)
+    if _answer_mentions_focus(rewritten, focus_phrase):
+        return rewritten
+    return rewritten if rewritten else cleaned
+
+
+def _question_focus_phrase(question: str) -> str:
+    tokens = [t for t in re.findall(r"[a-zA-Z]+", question.lower()) if len(t) > 2]
+    noisy = _GENERIC_QUERY_TERMS | _TREATMENT_TERMS | _DEFINITION_TERMS
+    kept = [t for t in tokens if t not in noisy]
+    if kept:
+        return " ".join(kept[:3])
+    return " ".join(tokens[:3]).strip()
 
 
 def _prompt(context: str, question: str) -> str:
+    focus = _question_focus_phrase(question)
+    focus_instruction = (
+        f'In the first sentence, explicitly mention "{focus}".\n' if focus else ""
+    )
     return (
         "You are a medical assistant.\n"
         "Answer the question using ONLY the provided context.\n"
         "Do not add or infer any medical information.\n"
         "Write natural, clear English with complete sentences.\n"
+        + focus_instruction +
         "Be concise and practical: 3-6 sentences maximum.\n"
         "Do not repeat the same phrase, citation, or source name.\n"
         "If the context is insufficient, answer exactly: "
@@ -403,7 +503,62 @@ def _clean_answer(text: str) -> str:
     text = re.sub(r"^\s*[-•]+\s*", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"(?:\bsee\b\s*)+$", "", text, flags=re.IGNORECASE).strip(" -,:;")
+    text = re.sub(r"\s+[a-zA-Z]$", "", text)
+    text = re.sub(r"\b(of|the|and|to|for|in|on|with)\s*$", "", text, flags=re.IGNORECASE).strip(" -,:;")
     return text
+
+
+def _extract_colon_labels_from_matches(matches: list[dict], max_items: int = 6) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for m in matches:
+        answer = _clean_answer(m.get("answer") or "")
+        if not answer:
+            continue
+        # Typical treatment entries are formatted like "Mohs surgery: ...".
+        found = re.findall(r"([A-Z][A-Za-z0-9/\-\s]{2,60}):", answer)
+        for label in found:
+            label = re.sub(r"\s+", " ", label).strip(" -,:;")
+            if not label:
+                continue
+            key = label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            labels.append(label)
+            if len(labels) >= max_items:
+                return labels
+    return labels
+
+
+def _should_expand_treatment_answer(question: str, answer: str) -> bool:
+    if _query_intent(question) != "treatment":
+        return False
+    a = answer.lower()
+    if "there are" in a and "type" in a:
+        return True
+    # Expand terse high-level answers.
+    return len(_tokenize(answer)) < 30
+
+
+def _expand_treatment_answer(question: str, answer: str, matches: list[dict]) -> str:
+    if not answer or answer == FALLBACK_ANSWER:
+        return answer
+    if not _should_expand_treatment_answer(question, answer):
+        return answer
+    labels = _extract_colon_labels_from_matches(matches, max_items=6)
+    if not labels:
+        return answer
+    existing = {t.lower() for t in _tokenize(answer)}
+    extras = [lab for lab in labels if not (_tokenize(lab) & existing)]
+    if not extras:
+        return answer
+    joined = "; ".join(extras[:4])
+    suffix = f" Common options include {joined}."
+    base = answer.rstrip()
+    if not re.search(r"[.!?]$", base):
+        base += "."
+    return f"{base}{suffix}"
 
 
 def _tokenize(text: str) -> set[str]:
@@ -417,10 +572,93 @@ def _has_term(text: str, terms: set[str]) -> bool:
 
 def _normalize_query_text(query: str) -> str:
     normalized = query.strip().lower()
-    for src, dst in _QUERY_NORMALIZATION_MAP.items():
-        normalized = re.sub(rf"\b{re.escape(src)}\b", dst, normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _build_dynamic_vocab(matches: list[dict]) -> set[str]:
+    vocab: set[str] = set()
+    for m in matches:
+        q = m.get("question") or ""
+        a = m.get("answer") or ""
+        for token in _tokenize(f"{q} {a}"):
+            if len(token) >= 4:
+                vocab.add(token)
+    return vocab
+
+
+def _correct_query_from_matches(query: str, matches: list[dict]) -> str:
+    vocab = _build_dynamic_vocab(matches)
+    if not vocab:
+        return query
+
+    def _replace_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if len(token) < 4:
+            return token
+        if token in vocab:
+            return token
+        candidate = get_close_matches(token, vocab, n=1, cutoff=TYPO_CORRECTION_CUTOFF)
+        if not candidate:
+            return token
+        best = candidate[0]
+        # Guardrail: avoid aggressive substitutions with different starts.
+        if token[0] != best[0]:
+            return token
+        return best
+
+    corrected = re.sub(r"\b[a-z]+\b", _replace_token, query)
+    corrected = re.sub(r"\s+", " ", corrected).strip()
+    return corrected
+
+
+def _query_match_quality(query: str, matches: list[dict]) -> float:
+    if not matches:
+        return -1e9
+    top = matches[0]
+    top_score = float(top.get("score", 0.0))
+    query_tokens = _content_tokens(query)
+    if not query_tokens:
+        query_tokens = _tokenize(query)
+    if not query_tokens:
+        return top_score
+    src_q = top.get("question") or ""
+    src_a = top.get("answer") or ""
+    src_tokens = _tokenize(f"{src_q} {src_a}")
+    overlap_ratio = len(query_tokens & src_tokens) / max(1, len(query_tokens))
+    return top_score + (0.20 * overlap_ratio)
+
+
+def _retrieve_with_dynamic_query_correction(query: str, candidate_k: int) -> tuple[str, list[dict]]:
+    bootstrap_k = min(max(candidate_k * TYPO_BOOTSTRAP_MULTIPLIER, candidate_k), TYPO_BOOTSTRAP_MAX_K)
+    current_query = query
+    current_matches = retrieve_matches(current_query, k=bootstrap_k)
+    if not current_matches:
+        return query, current_matches
+
+    best_query = current_query
+    best_matches = current_matches
+    best_quality = _query_match_quality(current_query, current_matches)
+
+    rounds = max(0, TYPO_CORRECTION_ROUNDS)
+    for _ in range(rounds):
+        corrected_query = _correct_query_from_matches(current_query, current_matches)
+        if corrected_query == current_query:
+            break
+        corrected_matches = retrieve_matches(corrected_query, k=bootstrap_k)
+        if not corrected_matches:
+            break
+        corrected_quality = _query_match_quality(corrected_query, corrected_matches)
+        if corrected_quality > best_quality:
+            best_query = corrected_query
+            best_matches = corrected_matches
+            best_quality = corrected_quality
+            current_query = corrected_query
+            current_matches = corrected_matches
+            continue
+        break
+
+    return best_query, best_matches[:candidate_k]
 
 
 def _query_intent(query: str) -> str:
@@ -459,6 +697,10 @@ def _handle_non_medical_query(question: str) -> str | None:
 def _content_tokens(text: str) -> set[str]:
     noisy = _GENERIC_QUERY_TERMS | _TREATMENT_TERMS | _DEFINITION_TERMS
     return {t for t in _tokenize(text) if t not in noisy}
+
+
+def _requires_strict_entity_match(query: str) -> bool:
+    return len(_content_tokens(query)) >= 2
 
 
 def _rerank_matches(query: str, matches: list[dict]) -> list[dict]:
@@ -505,11 +747,14 @@ def _entity_filtered_matches(query: str, ranked_matches: list[dict]) -> list[dic
     if not q_content:
         return ranked_matches
     filtered: list[dict] = []
+    # Require stronger overlap for multi-token entities to avoid condition mismatches.
+    min_required_overlap = max(1, math.ceil(len(q_content) * 0.6))
     for match in ranked_matches:
         src_q = match.get("question") or ""
         src_a = match.get("answer") or ""
         src_tokens = _tokenize(src_q) | _tokenize(src_a)
-        if q_content & src_tokens:
+        overlap = len(q_content & src_tokens)
+        if overlap >= min_required_overlap:
             filtered.append(match)
     return filtered
 
@@ -547,11 +792,13 @@ def _extractive_from_matches(matches: list[dict]) -> str:
 def retrieve_context(query: str, k: int | None = None) -> str:
     normalized_query = _normalize_query_text(query)
     candidate_k = max(k or TOP_K, CONTEXT_TOP_K, RERANK_CANDIDATE_K)
-    matches = retrieve_matches(normalized_query, k=candidate_k)
+    normalized_query, matches = _retrieve_with_dynamic_query_correction(normalized_query, candidate_k)
     if not matches:
         return ""
     ranked = _rerank_matches(normalized_query, matches)
     filtered = _entity_filtered_matches(normalized_query, ranked)
+    if _requires_strict_entity_match(normalized_query) and not filtered:
+        return ""
     active = filtered or ranked
     return _build_context(active)
 
@@ -587,7 +834,7 @@ def answer_question(question: str, debug: bool = False) -> dict:
 
     normalized_question = _normalize_query_text(question)
     candidate_k = max(TOP_K, RERANK_CANDIDATE_K, CONTEXT_TOP_K)
-    matches = retrieve_matches(normalized_question, k=candidate_k)
+    normalized_question, matches = _retrieve_with_dynamic_query_correction(normalized_question, candidate_k)
     if not matches:
         return {
             "answer": "I don't know based on the available medical data.",
@@ -597,6 +844,12 @@ def answer_question(question: str, debug: bool = False) -> dict:
 
     ranked_matches = _rerank_matches(normalized_question, matches)[:candidate_k]
     entity_matches = _entity_filtered_matches(normalized_question, ranked_matches)
+    if _requires_strict_entity_match(normalized_question) and not entity_matches:
+        return {
+            "answer": "I don't know based on the available medical data.",
+            "source_question": None,
+            **({"matches": ranked_matches} if debug else {}),
+        }
     active_matches = entity_matches or ranked_matches
     if not active_matches:
         return {
@@ -633,10 +886,12 @@ def answer_question(question: str, debug: bool = False) -> dict:
         }
 
     source_question = best.get("question")
+    focus_reference = source_question or normalized_question
     if not USE_GENERATOR:
         extractive = _extractive_from_matches(active_matches)
         answer_out = extractive or FALLBACK_ANSWER
-        answer_out = _postprocess_answer(answer_out)
+        answer_out = _postprocess_answer(answer_out, focus_reference)
+        answer_out = _expand_treatment_answer(normalized_question, answer_out, active_matches)
         if answer_out != FALLBACK_ANSWER and _needs_disclaimer(question):
             answer_out = _append_disclaimer(answer_out)
         return {
@@ -645,9 +900,10 @@ def answer_question(question: str, debug: bool = False) -> dict:
             **({"matches": ranked_matches, "context": context} if debug else {}),
         }
 
-    prompt = _prompt(context, question)
+    prompt = _prompt(context, normalized_question)
     result = _generate_text(prompt)
-    cleaned_result = _postprocess_answer(result)
+    cleaned_result = _postprocess_answer(result, focus_reference)
+    cleaned_result = _expand_treatment_answer(normalized_question, cleaned_result, active_matches)
     if cleaned_result == FALLBACK_ANSWER:
         answer = FALLBACK_ANSWER
     else:
