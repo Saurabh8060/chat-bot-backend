@@ -1,6 +1,9 @@
 import os
 from dotenv import load_dotenv
 
+# Avoid slow Pydantic plugin auto-discovery during app startup.
+os.environ.setdefault("PYDANTIC_DISABLE_PLUGINS", "__all__")
+
 # Load .env before importing helper
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -24,6 +27,9 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str | None = None
     question: str | None = None
+    last_topic: str | None = None
+    previous_user_message: str | None = None
+    previous_assistant_message: str | None = None
     debug: bool | None = None
 
 
@@ -38,7 +44,16 @@ def chat(payload: ChatRequest):
     if not question:
         return {"answer": "Please provide a question.", "sources": []}
 
-    return answer_question(question, debug=bool(payload.debug))
+    last_topic = (payload.last_topic or "").strip() or None
+    previous_user_message = (payload.previous_user_message or "").strip() or None
+    previous_assistant_message = (payload.previous_assistant_message or "").strip() or None
+    return answer_question(
+        question,
+        last_topic=last_topic,
+        previous_user_message=previous_user_message,
+        previous_assistant_message=previous_assistant_message,
+        debug=bool(payload.debug),
+    )
 
 
 if __name__ == "__main__":

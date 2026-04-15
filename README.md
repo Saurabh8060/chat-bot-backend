@@ -11,15 +11,13 @@ pinned: false
 
 FastAPI backend for a medical RAG chatbot powered by Pinecone retrieval, Sentence Transformers embeddings, and Hugging Face generation.
 
-This backend retrieves relevant medical Q/A pairs, applies filtering and reranking, and returns either a grounded answer or a safe fallback when the available context is not strong enough.
+This backend retrieves relevant medical Q/A pairs and returns either a grounded answer or a safe fallback when the available context is not strong enough.
 
 ## Features
 
 - FastAPI API for chat-style question answering
 - Pinecone-backed semantic retrieval
 - Sentence Transformers embeddings with vector normalization
-- Optional cross-encoder reranking for better relevance
-- Query typo correction and entity-aware filtering
 - Safe fallback behavior for unsupported questions
 - Basic medical safety guardrails and disclaimers
 - LoRA fine-tuning script for the generator model
@@ -47,8 +45,6 @@ This backend retrieves relevant medical Q/A pairs, applies filtering and reranki
 |   `-- ingest_medquad.py
 |-- training/
 |   `-- finetune_lora.py
-|-- embeddings/
-|   `-- build_index.py
 `-- data/
 ```
 
@@ -82,10 +78,14 @@ PINECONE_CREATE_INDEX=0
 
 EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 HF_MODEL=google/flan-t5-base
+HF_MAX_NEW_TOKENS=160
+HF_MIN_NEW_TOKENS=48
+HF_NUM_BEAMS=2
 USE_GENERATOR=1
-USE_CROSS_ENCODER=1
 TOP_K=5
 SIM_THRESHOLD=0.35
+MAX_ANSWER_SENTENCES=6
+MAX_ANSWER_CHARS=900
 PORT=8000
 ```
 
@@ -144,8 +144,7 @@ Typical response:
 1. The API receives a user question at `POST /chat`.
 2. The question is embedded with `sentence-transformers/all-MiniLM-L6-v2`.
 3. The backend retrieves relevant Q/A entries from Pinecone.
-4. Matches can be reranked and filtered for stronger entity alignment.
-5. The backend either generates a grounded response with `google/flan-t5-base` or returns a safe fallback when confidence is too low.
+4. The backend either generates a grounded response with `google/flan-t5-base` or returns a safe fallback when confidence is too low.
 
 ## Data Ingestion
 
@@ -185,7 +184,6 @@ Artifacts are saved to `lora_model` by default.
 ### Slow local inference
 
 - Set `USE_GENERATOR=0` to return extractive answers only.
-- Set `USE_CROSS_ENCODER=0` to disable reranking and reduce resource usage.
 
 ### Empty or weak answers
 
